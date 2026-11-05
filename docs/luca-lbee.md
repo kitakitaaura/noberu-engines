@@ -105,6 +105,26 @@ simulator stubs them: `BTFUNC` ends a battle by setting one side's HP to 0,
 `GMFUNC 1/3/4` (baseball) put random results in `#6211`/`#6213`/`#6215` in
 the ranges the script tests.
 
+Saya's labyrinth (`SEEN2804`-`2808`): the engine moves the player and
+reports the tile in `#10003`/`#10004`; each event tile runs a block. The
+stub walks every event tile three times, then the exit. Days 1-2 pass.
+Days 3-5 (`SEEN2806`-`2808`) add puzzle counters (`#6336`-`#6349`) and
+Saya's moving position (`#6073`/`#6074`) and are not solved yet. A greedy
+"take the tile that changes something" solver was tried and was worse.
+
+## Choice search
+
+`explore` is a breadth-first search over SELECTs. States merge on (scene,
+command, call stacks, `#0`-`#1999`, `#12xxx`). Each depth runs on all
+cores. When the frontier passes the cap, half is kept by rarity of its set
+flags and half at random (rarity alone loses the common routes, random
+alone loses Rin's). Minigame segments are run with 4 dice (path letters
+`a`-`c` after the first), and every path replays exactly (`replay`).
+
+`campaign` repeats it from a new game and from Refrain (`SEEN2513`, which
+no script jumps to: the executable starts it), carrying the persistent
+flags left at all endings found so far.
+
 ## Tools
 
 ```

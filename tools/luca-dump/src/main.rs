@@ -11,6 +11,7 @@
 //!   luca-dump engine-vars <SCRIPT.PAK>      variables only the engine sets
 //!   luca-dump explore <SCRIPT.PAK> [cap] [seed] [#var=value,...]  breadth-first search over choices
 //!   luca-dump campaign <SCRIPT.PAK> [cap] [seed]  repeat the search, carrying persistent flags between rounds
+//!   luca-dump probe <SCRIPT.PAK> <scene> [#var=value,...]  run one scene with stubs, show where it sticks
 //!   luca-dump replay <SCRIPT.PAK> <start> <seed> <choices> [#var=value,...]  play one path, show what it reached
 
 mod explore;
@@ -214,6 +215,22 @@ fn scripts(path: &str, outdir: &str) -> Res<()> {
     Ok(())
 }
 
+/// A JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 fn main() -> Res<()> {
     let a: Vec<String> = std::env::args().collect();
     let arg = |i: usize| a.get(i).map(String::as_str).ok_or("missing argument");
@@ -251,8 +268,7 @@ fn main() -> Res<()> {
             println!("time {:?}", t.elapsed());
             println!("trophies:");
             for (t, f) in &rep.trophies {
-                let p: String = f.path.iter().map(|c| char::from(b'0' + c)).collect();
-                println!("  {t:>3}  after {:>3} choices  {p}", f.depth);
+                println!("  {t:>3}  after {:>3} choices  {}", f.depth, explore::path_str(&f.path));
             }
             println!("endings:");
             for (e, f) in &rep.endings {
@@ -317,10 +333,35 @@ fn main() -> Res<()> {
                 }
             }
             println!("trophies (round, start, choices; replayed from scratch to check):");
+            // Route file: per trophy, the flags it needs and every choice with its text.
+            let mut json = String::from("{\n");
+            for (n, (t, h)) in trophies.iter().enumerate() {
+                let r = explore::replay(&game, h.start, &h.flags, h.seed, &h.path);
+                let q = json_str;
+                json += &format!(
+                    "  \"{t}\": {{\"start\": {}, \"seed\": {}, \"path\": {}, \"reached\": {}, \"flags\": {{{}}}, \"choices\": [\n",
+                    q(h.start),
+                    h.seed,
+                    q(&explore::path_str(&h.path)),
+                    r.trophies.contains(t),
+                    h.flags.iter().map(|(k, v)| format!("\"{k}\": {v}")).collect::<Vec<_>>().join(", ")
+                );
+                for (i, (sc, pos, opts, pick)) in r.choices.iter().enumerate() {
+                    json += &format!(
+                        "    {{\"scene\": {}, \"pos\": {pos}, \"options\": [{}], \"pick\": {pick}}}{}\n",
+                        q(sc),
+                        opts.iter().map(|o| q(o)).collect::<Vec<_>>().join(", "),
+                        if i + 1 < r.choices.len() { "," } else { "" }
+                    );
+                }
+                json += &format!("  ]}}{}\n", if n + 1 < trophies.len() { "," } else { "" });
+            }
+            json += "}\n";
+            std::fs::write("target/lbee-routes.json", &json)?;
             for (t, h) in &trophies {
                 let r = explore::replay(&game, h.start, &h.flags, h.seed, &h.path);
                 let ok = if r.trophies.contains(t) { "ok" } else { "REPLAY FAILED" };
-                let p: String = h.path.iter().map(|c| char::from(b'0' + c)).collect();
+                let p = explore::path_str(&h.path);
                 println!("  {t:>3}  round {}  {}  {:>3} choices  {ok}  {p}", h.round, h.start, h.path.len());
             }
             println!("endings (first round reached):");
@@ -332,11 +373,25 @@ fn main() -> Res<()> {
             println!("scenes with text never shown: {} {:?}", missing.len(), missing);
             Ok(())
         }
+        Some("probe") => {
+            let game = sim::load_game(arg(2)?)?;
+            let mut flags = Vec::new();
+            for kv in a.get(4).map(String::as_str).unwrap_or("").split(',').filter(|s| !s.is_empty()) {
+                let (k, v) = kv.trim_start_matches('#').split_once('=').ok_or("use #var=value")?;
+                flags.push((k.parse()?, v.parse()?));
+            }
+            sim::probe(&game, arg(3)?, &flags, 1);
+            Ok(())
+        }
         Some("replay") => {
             let game = sim::load_game(arg(2)?)?;
             let start = arg(3)?;
             let seed: u64 = arg(4)?.parse()?;
-            let path: Vec<u8> = arg(5)?.bytes().map(|c| c - b'0').collect();
+            // choices as digits; minigame dice as letters a, b, c (DICE + 0, 1, 2)
+            let path: Vec<u8> = arg(5)?
+                .bytes()
+                .map(|c| if c.is_ascii_lowercase() { explore::DICE + (c - b'a') } else { c - b'0' })
+                .collect();
             let mut flags = Vec::new();
             for kv in a.get(6).map(String::as_str).unwrap_or("").split(',').filter(|s| !s.is_empty()) {
                 let (k, v) = kv.trim_start_matches('#').split_once('=').ok_or("use #var=value")?;

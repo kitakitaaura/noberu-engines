@@ -19,6 +19,15 @@ use std::hash::{Hash, Hasher};
 
 /// Instructions one segment (choice to choice) may run before we call it stuck.
 const SEGMENT_BUDGET: usize = 2_000_000;
+/// Path bytes at or above this are dice for minigame outcomes, not choices.
+pub const DICE: u8 = 10;
+/// Choices as digits, minigame dice as letters (a = DICE).
+pub fn path_str(path: &[u8]) -> String {
+    path.iter().map(|&c| if c >= DICE { char::from(b'a' + c - DICE) } else { char::from(b'0' + c) }).collect()
+}
+
+/// Extra outcomes tried for a segment that runs a minigame.
+const DICE_VARIANTS: u8 = 3;
 
 /// Paused VM stored compactly: nonzero variables only.
 struct Node {
@@ -156,12 +165,32 @@ pub fn bfs(game: &Game, start: &str, persist: &[(u16, i32)], cap: usize, seed: u
     let mut seen: HashSet<u64> = frontier.iter().map(|(_, k)| *k).collect();
     while !frontier.is_empty() {
         if frontier.len() > cap {
-            // keep a random sample (Fisher-Yates prefix)
-            for i in 0..cap {
-                let j = i + rng.below(frontier.len() - i);
-                frontier.swap(i, j);
+            // Keep the states with the rarest story flags: a route's flags are
+            // rare among all states, and a random sample tends to lose them.
+            let mut count = vec![0u32; 2000];
+            for (n, _) in &frontier {
+                for &(v, _) in n.vars.iter().take_while(|(v, _)| *v < 2000) {
+                    count[v as usize] += 1;
+                }
             }
-            frontier.truncate(cap);
+            let mut scored: Vec<(f64, u64, (Node, u64))> = frontier
+                .into_iter()
+                .map(|(n, k)| {
+                    let score: f64 =
+                        n.vars.iter().take_while(|(v, _)| *v < 2000).map(|&(v, _)| 1.0 / count[v as usize] as f64).sum();
+                    (score, rng.next(), (n, k))
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            // Half by rarity, half a random sample of the rest (rarity alone
+            // starves the common routes).
+            let half = cap / 2;
+            for i in half..cap {
+                let j = i + rng.below(scored.len() - i);
+                scored.swap(i, j);
+            }
+            scored.truncate(cap);
+            frontier = scored.into_iter().map(|(_, _, x)| x).collect();
         }
         rep.levels.push(frontier.len());
         if rep.levels.len() % 10 == 0 {
@@ -211,11 +240,24 @@ pub fn bfs(game: &Game, start: &str, persist: &[(u16, i32)], cap: usize, seed: u
     rep
 }
 
-/// Run until the next choice or the end; record what happened.
-fn advance(game: &Game, mut vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Report, out: &mut Vec<(Node, u64)>) {
+/// Run until the next choice or the end; record what happened. A segment
+/// that plays a minigame is also run with other dice (path gets a DICE byte),
+/// so different outcomes are explored.
+fn advance(game: &Game, vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Report, out: &mut Vec<(Node, u64)>) {
+    if advance_one(game, vm.clone(), path.clone(), seed, rep, out) {
+        for d in 0..DICE_VARIANTS {
+            let mut p = path.clone();
+            p.push(DICE + d);
+            advance_one(game, vm.clone(), p, seed, rep, out);
+        }
+    }
+}
+
+/// Returns whether a minigame stub ran.
+fn advance_one(game: &Game, mut vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Report, out: &mut Vec<(Node, u64)>) -> bool {
     let mut host = Recorder { rng: Some(Rng(segment_seed(seed, &path))), ..Default::default() };
     let stop = vm.run(game, &mut host, SEGMENT_BUDGET);
-    let depth = path.len();
+    let depth = path.iter().filter(|&&c| c < DICE).count();
     for t in host.trophies.drain(..) {
         keep(&mut rep.trophies, t, Found { path: path.clone(), depth });
     }
@@ -245,6 +287,7 @@ fn advance(game: &Game, mut vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Report, 
             keep(&mut rep.endings, at, Found { path, depth });
         }
     }
+    host.minigame
 }
 
 /// What a replayed path did.
@@ -255,6 +298,8 @@ pub struct Replay {
     pub scenes: BTreeSet<String>,
     /// Choices left unused when the run ended early (path doesn't fit).
     pub unused: usize,
+    /// Each choice made: scene, byte position, options (English), picked.
+    pub choices: Vec<(String, u32, Vec<String>, usize)>,
 }
 
 /// Play one path from a fresh start with the same per-segment random
@@ -263,20 +308,30 @@ pub fn replay(game: &Game, start: &str, persist: &[(u16, i32)], seed: u64, path:
     let mut vm = start_vm(game, start, persist);
     let mut trophies = Vec::new();
     let mut scenes = BTreeSet::new();
+    let mut choices = Vec::new();
     let mut i = 0;
     loop {
+        // a dice byte picks the minigame outcome for the segment it precedes
+        if i < path.len() && path[i] >= DICE {
+            i += 1;
+        }
         let mut host = Recorder { rng: Some(Rng(segment_seed(seed, &path[..i]))), ..Default::default() };
         let stop = vm.run(game, &mut host, SEGMENT_BUDGET);
         trophies.extend(host.trophies);
         scenes.extend(host.scenes.iter().map(|s| game.name(*s).to_string()));
         match stop {
             Stop::Select { options, .. } if i < path.len() && (path[i] as usize) < options => {
+                let op = &game.scenes[vm.scene].script.ops[vm.pc];
+                if let luca_script::Kind::Select { en, .. } = &op.kind {
+                    let opts = en.split("$d").map(str::to_string).collect();
+                    choices.push((game.name(vm.scene).to_string(), op.pos, opts, path[i] as usize));
+                }
                 vm.choose(path[i] as usize);
                 i += 1;
             }
             stop => {
                 let at = format!("{} @{}", game.name(vm.scene), game.scenes[vm.scene].script.ops.get(vm.pc).map_or(0, |o| o.pos));
-                return Replay { trophies, stop, at, scenes, unused: path.len() - i };
+                return Replay { trophies, stop, at, scenes, unused: path.len() - i, choices };
             }
         }
     }

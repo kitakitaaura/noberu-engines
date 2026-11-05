@@ -38,6 +38,8 @@ pub struct Recorder {
     pub messages: usize,
     pub scenes: BTreeSet<usize>,
     pub rng: Option<Rng>,
+    /// A minigame stub drew random results in this run.
+    pub minigame: bool,
 }
 
 impl Host for Recorder {
@@ -53,6 +55,7 @@ impl Host for Recorder {
         *self.engine_ops.entry(name.to_string()).or_default() += 1;
         // Minigame stubs. Battles loop until a fighter's HP (#8188/#8189)
         // reaches 0; the real engine computes damage. Pick a winner at random.
+        let minigame = &mut self.minigame;
         let mut pick = |n: usize| match &mut self.rng {
             Some(r) => r.below(n) as i32,
             None => 0,
@@ -61,19 +64,26 @@ impl Host for Recorder {
         let arg = op.params.get(..2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
         match name {
             "BTFUNC" => {
+                *minigame = true;
                 let loser = pick(2) as u16;
                 vm.set(8188 + loser, 0);
             }
             // Baseball game (SEEN8030): result of each step, values as the script tests them.
-            "GMFUNC" => match arg {
-                1 => vm.set(6211, pick(4) - 1),
-                3 => vm.set(6213, pick(9)),
-                4 => vm.set(6215, pick(4)),
-                _ => {}
-            },
+            "GMFUNC" => {
+                *minigame = true;
+                match arg {
+                    1 => vm.set(6211, pick(4) - 1),
+                    3 => vm.set(6213, pick(9)),
+                    4 => vm.set(6215, pick(4)),
+                    _ => {}
+                }
+            }
             // Saya's labyrinth (SEEN2804-2808): TASK 45 is one move; the
             // engine reports the tile in #10003/#10004.
-            "TASK" if arg == 45 => maze_step(game, vm, s, pc),
+            "TASK" if arg == 45 => {
+                *minigame = true;
+                maze_step(game, vm, s, pc)
+            }
             _ => {}
         }
     }
@@ -115,12 +125,28 @@ fn maze_tiles(game: &Game, s: usize, pc: usize) -> Vec<(i32, i32, bool)> {
     tiles
 }
 
+type Tiles = std::sync::Arc<Vec<(i32, i32, bool)>>;
+
+/// Tiles per move command, computed once (scanning the scene each move made
+/// stuck labyrinth runs very slow).
+fn maze_tiles_cached(game: &Game, s: usize, pc: usize) -> Tiles {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<(usize, usize), Tiles>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(t) = cache.lock().unwrap().get(&(s, pc)) {
+        return t.clone();
+    }
+    let t: Tiles = std::sync::Arc::new(maze_tiles(game, s, pc));
+    cache.lock().unwrap().insert((s, pc), t.clone());
+    t
+}
+
 fn maze_step(game: &Game, vm: &mut Vm, s: usize, pc: usize) {
-    let tiles = maze_tiles(game, s, pc);
+    let tiles = maze_tiles_cached(game, s, pc);
     let events: Vec<_> = tiles.iter().filter(|t| !t.2).collect();
     let exit = tiles.iter().find(|t| t.2);
     let step = vm.get(MAZE_STEP) as usize;
     // Every event tile three times (some unlock others), then the exit.
+    // Days 3-5 (SEEN2806-2808) have puzzles this does not solve yet.
     let tile = if step < events.len() * 3 { Some(events[step % events.len()]) } else { exit };
     if let Some(&(x, y, is_exit)) = tile {
         vm.set(10003, x);
@@ -233,4 +259,41 @@ pub fn playouts(game: &Game, start: &str, runs: usize, seed: u64) {
         println!("  {v:>6}  {k}");
     }
     println!("engine commands met: {engine_ops:?}");
+}
+
+/// Run one scene directly (choices: always the first option) and show where
+/// it stops; when stuck, print the commands of the loop.
+pub fn probe(game: &Game, scene: &str, flags: &[(u16, i32)], seed: u64) {
+    let mut vm = Vm::new(game.scene(scene).expect("scene"));
+    for &(v, x) in flags {
+        vm.set(v, x);
+    }
+    let mut host = Recorder { rng: Some(Rng(seed | 1)), ..Default::default() };
+    let t = std::time::Instant::now();
+    let mut choices = 0;
+    let stop = loop {
+        match vm.run(game, &mut host, 20_000_000) {
+            Stop::Select { .. } => {
+                choices += 1;
+                vm.choose(0);
+            }
+            s => break s,
+        }
+    };
+    println!("{stop:?} in {} @{} after {choices} choices, {:?}", game.name(vm.scene), vm.pc, t.elapsed());
+    println!("engine commands: {:?}", host.engine_ops);
+    println!("maze step #{MAZE_STEP} = {}, tile ({}, {})", vm.get(MAZE_STEP), vm.get(10003), vm.get(10004));
+    if stop == Stop::Limit {
+        let mut seen = BTreeSet::new();
+        for _ in 0..2000 {
+            seen.insert((vm.scene, vm.pc));
+            if vm.run(game, &mut host, 1) != Stop::Limit {
+                break;
+            }
+        }
+        for (sc, pc) in seen {
+            let op = &game.scenes[sc].script.ops[pc];
+            println!("   {} {:>6}: {}", game.name(sc), op.pos, format!("{op}").chars().take(120).collect::<String>());
+        }
+    }
 }
