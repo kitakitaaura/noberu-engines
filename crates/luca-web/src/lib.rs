@@ -167,6 +167,14 @@ fn u32_at(b: &[u8], i: usize) -> Option<u32> {
     Some(u32::from_le_bytes([*b.get(i)?, *b.get(i + 1)?, *b.get(i + 2)?, *b.get(i + 3)?]))
 }
 
+#[derive(Default, Clone, Debug, PartialEq)]
+struct Seg {
+    text: String,
+    /// "rrggbb", or empty for the default colour
+    color: String,
+    keyword: bool,
+}
+
 struct WebHost {
     events: Vec<String>,
     /// `_VARSTR` table: index -> text.
@@ -182,14 +190,34 @@ impl WebHost {
     }
 
     /// Message text for display: `$(slot,lang)` string variables, `$v(expr)`
-    /// values, other codes dropped. `lang` 0 = Japanese, 1 = English.
+    /// values; other codes dropped. `lang` 0 = Japanese, 1 = English.
     fn render(&self, vm: &Vm, s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
+        self.render_rich(vm, s).into_iter().map(|g| g.text).collect()
+    }
+
+    /// Like `render`, as pieces with their style: `$C[rrggbb]` colour (until
+    /// `$C[]`) and `$K<n>` glossary keywords (until `$K0`).
+    fn render_rich(&self, vm: &Vm, s: &str) -> Vec<Seg> {
+        let mut segs: Vec<Seg> = vec![Seg::default()];
+        let push = |segs: &mut Vec<Seg>, t: &str| segs.last_mut().unwrap().text.push_str(t);
+        let restyle = |segs: &mut Vec<Seg>, color: Option<String>, keyword: Option<bool>| {
+            let last = segs.last().unwrap();
+            let next = Seg {
+                text: String::new(),
+                color: color.unwrap_or_else(|| last.color.clone()),
+                keyword: keyword.unwrap_or(last.keyword),
+            };
+            if last.text.is_empty() {
+                *segs.last_mut().unwrap() = next;
+            } else {
+                segs.push(next);
+            }
+        };
         let b: Vec<char> = s.chars().collect();
         let mut i = 0;
         while i < b.len() {
             if b[i] != '$' || i + 1 >= b.len() {
-                out.push(b[i]);
+                segs.last_mut().unwrap().text.push(b[i]);
                 i += 1;
                 continue;
             }
@@ -204,7 +232,7 @@ impl WebHost {
                     let mut it = inner.split(',').map(|x| x.trim().parse::<u16>().unwrap_or(0));
                     let (slot, lang) = (it.next().unwrap_or(0), it.next().unwrap_or(1));
                     if let Some((jp, en)) = self.varstr.get(&slot) {
-                        out.push_str(if lang == 0 { jp } else { en });
+                        push(&mut segs, if lang == 0 { jp } else { en });
                     }
                 }
                 'v' if b.get(i) == Some(&'(') => {
@@ -227,19 +255,30 @@ impl WebHost {
                     let inner: String = b[i + 1..end.min(b.len())].iter().collect();
                     i = (end + 1).min(b.len());
                     if let Ok(e) = expr::parse(&inner) {
-                        out.push_str(&e.eval(&|v| vm.get(v)).to_string());
+                        push(&mut segs, &e.eval(&|v| vm.get(v)).to_string());
                     }
                 }
-                // $C[rrggbb] colour, $C[] end: drop
                 'C' if b.get(i) == Some(&'[') => {
-                    i = b[i..].iter().position(|&c| c == ']').map_or(b.len(), |p| i + p + 1);
+                    let end = b[i..].iter().position(|&c| c == ']').map_or(b.len(), |p| i + p);
+                    let color: String = b[i + 1..end].iter().collect();
+                    i = (end + 1).min(b.len());
+                    let ok = color.len() == 6 && color.chars().all(|c| c.is_ascii_hexdigit());
+                    restyle(&mut segs, Some(if ok { color } else { String::new() }), None);
                 }
                 // $I{n} indent: drop
                 'I' if b.get(i) == Some(&'{') => {
                     i = b[i..].iter().position(|&c| c == '}').map_or(b.len(), |p| i + p + 1);
                 }
-                // $K85 keyword start / $K0 end, $S024: drop the code and its digits
-                'K' | 'S' => {
+                'K' => {
+                    let st = i;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let n: String = b[st..i].iter().collect();
+                    restyle(&mut segs, None, Some(n != "0" && !n.is_empty()));
+                }
+                // $S024: drop the code and its digits
+                'S' => {
                     while i < b.len() && b[i].is_ascii_digit() {
                         i += 1;
                     }
@@ -247,12 +286,13 @@ impl WebHost {
                 // $w wait, $d line split: drop
                 'w' | 'd' => {}
                 other => {
-                    out.push('$');
-                    out.push(other);
+                    push(&mut segs, "$");
+                    segs.last_mut().unwrap().text.push(other);
                 }
             }
         }
-        out
+        segs.retain(|g| !g.text.is_empty());
+        segs
     }
 
     /// Split "`Name@text" into (name, text).
@@ -278,7 +318,11 @@ impl Host for WebHost {
             }
             _ => return false,
         };
-        let (name, text) = Self::speaker(&self.render(vm, en));
+        // Split the speaker off before rendering: a name can itself be a code.
+        let (name_raw, body_raw) = Self::speaker(en);
+        let name = self.render(vm, &name_raw);
+        let rich = self.render_rich(vm, &body_raw);
+        let text: String = rich.iter().map(|g| g.text.as_str()).collect();
         let (jp_name, jp_text) = Self::speaker(&self.render(vm, jp));
         if text.trim().is_empty() && name.is_empty() {
             return false;
@@ -287,6 +331,18 @@ impl Host for WebHost {
         json_str(&name, &mut e);
         e.push_str(",\"text\":");
         json_str(&text, &mut e);
+        e.push_str(",\"rich\":[");
+        for (i, g) in rich.iter().enumerate() {
+            if i > 0 {
+                e.push(',');
+            }
+            e.push('[');
+            json_str(&g.text, &mut e);
+            e.push(',');
+            json_str(&g.color, &mut e);
+            e.push_str(if g.keyword { ",1]" } else { ",0]" });
+        }
+        e.push(']');
         e.push_str(",\"jp_name\":");
         json_str(&jp_name, &mut e);
         e.push_str(",\"jp\":");
@@ -346,6 +402,10 @@ impl Host for WebHost {
                 }
                 false
             }
+            "SHAKELIST" | "SG_QUAKE" | "FULLQUAKE_ZOOM" | "SHAKE" => {
+                self.event("{\"t\":\"shake\"}".into());
+                false
+            }
             "CLOSE_WINDOW" => {
                 self.event("{\"t\":\"close\"}".into());
                 false
@@ -384,6 +444,33 @@ impl Host for WebHost {
 
     fn random(&mut self, lo: i32, hi: i32) -> i32 {
         lo + self.rng.below((hi - lo + 1).max(1) as usize) as i32
+    }
+}
+
+fn bad_save() -> JsError {
+    err("not a LUCA save, or a damaged one")
+}
+
+struct SaveReader<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+
+impl<'a> SaveReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], JsError> {
+        let s = self.b.get(self.p..self.p + n).ok_or_else(bad_save)?;
+        self.p += n;
+        Ok(s)
+    }
+    fn u16(&mut self) -> Result<u16, JsError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, JsError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn text(&mut self) -> Result<String, JsError> {
+        let n = self.u32()? as usize;
+        Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
     }
 }
 
@@ -462,15 +549,7 @@ impl Player {
             match self.vm.run(&self.game, &mut self.host, 5_000_000) {
                 Stop::Pause => {}
                 Stop::Select { .. } => {
-                    let op = &self.game.scenes[self.vm.scene].script.ops[self.vm.pc];
-                    let options: Vec<String> = match &op.kind {
-                        Kind::Select { en, .. } => {
-                            let text = self.host.render(&self.vm, &en.replace("$d", "\u{1}"));
-                            text.split('\u{1}').map(str::to_string).collect()
-                        }
-                        _ => vec![],
-                    };
-                    self.pending_select = Some(options);
+                    self.pending_select = Some(self.select_options());
                     return self.step_select_event();
                 }
                 stop @ (Stop::End | Stop::Limit) => {
@@ -503,6 +582,104 @@ impl Player {
         e.push_str("]}");
         self.host.events.push(e);
         format!("[{}]", self.host.events.join(","))
+    }
+
+    /// Options of the SELECT the VM is stopped at.
+    fn select_options(&self) -> Vec<String> {
+        let op = &self.game.scenes[self.vm.scene].script.ops[self.vm.pc];
+        match &op.kind {
+            Kind::Select { en, .. } => {
+                let text = self.host.render(&self.vm, &en.replace("$d", "\u{1}"));
+                text.split('\u{1}').map(str::to_string).collect()
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Save the game at the current pause. `page` is the page's own state
+    /// (what is on screen, music, the line being shown), returned by `load`.
+    pub fn save(&self, page: &str) -> Vec<u8> {
+        let mut out = b"LUCASAVE".to_vec();
+        let vm = self.vm.save(&self.game);
+        out.extend_from_slice(&(vm.len() as u32).to_le_bytes());
+        out.extend_from_slice(&vm);
+        let put = |out: &mut Vec<u8>, s: &str| {
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        };
+        let mut slots: Vec<_> = self.host.varstr.iter().collect();
+        slots.sort_by_key(|(k, _)| **k);
+        out.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+        for (slot, (jp, en)) in slots {
+            out.extend_from_slice(&slot.to_le_bytes());
+            put(&mut out, jp);
+            put(&mut out, en);
+        }
+        put(&mut out, page);
+        out
+    }
+
+    /// Restore a save made by `save`; returns the page state given then.
+    /// Persistent flags (#12000-#12999) keep their current values: they belong
+    /// to the player, not to the save.
+    pub fn load(&mut self, bytes: &[u8]) -> Result<String, JsError> {
+        let rest = bytes.strip_prefix(b"LUCASAVE").ok_or_else(bad_save)?;
+        let mut r = SaveReader { b: rest, p: 0 };
+        let n = r.u32()? as usize;
+        let mut vm = Vm::load(&self.game, r.take(n)?).map_err(err)?;
+        let mut varstr = HashMap::new();
+        for _ in 0..r.u32()? {
+            let slot = r.u16()?;
+            let jp = r.text()?;
+            let en = r.text()?;
+            varstr.insert(slot, (jp, en));
+        }
+        let page = r.text()?;
+        let persistent = luca_lbee::PERSISTENT;
+        vm.vars[persistent.clone()].copy_from_slice(&self.vm.vars[persistent]);
+        self.vm = vm;
+        self.host.varstr = varstr;
+        self.ended = false;
+        self.pending_select = self.vm.pending_select.map(|_| self.select_options());
+        Ok(page)
+    }
+
+    /// English text of a string variable (slot 0 holds the in-game date).
+    pub fn varstr(&self, slot: u16) -> String {
+        self.host.varstr.get(&slot).map(|v| v.1.clone()).unwrap_or_default()
+    }
+
+    /// Persistent flags #12000-#12999 (cleared routes, unlocks), to keep
+    /// between sessions.
+    pub fn globals(&self) -> Vec<i32> {
+        self.vm.vars[luca_lbee::PERSISTENT].to_vec()
+    }
+
+    pub fn set_globals(&mut self, g: Vec<i32>) {
+        let r = luca_lbee::PERSISTENT;
+        if g.len() == r.len() {
+            self.vm.vars[r].copy_from_slice(&g);
+        }
+    }
+
+    /// Start over at the beginning (`refrain`: at Refrain), keeping the
+    /// persistent flags and clearing everything else.
+    pub fn new_game(&mut self, refrain: bool) -> Result<(), JsError> {
+        let name = if refrain { luca_lbee::REFRAIN } else { luca_lbee::START };
+        let scene = self.game.scene(name).ok_or_else(|| err(format!("no scene {name}")))?;
+        let globals = self.globals();
+        self.vm = Vm::new(scene);
+        self.set_globals(globals);
+        self.host.varstr.clear();
+        self.pending_select = None;
+        self.ended = false;
+        Ok(())
+    }
+
+    /// Refrain opens once Rin's route has ended (#12002, set at the end of
+    /// SEEN2001), which itself needs the five other heroines.
+    pub fn refrain_unlocked(&self) -> bool {
+        self.vm.get(12002) != 0
     }
 
     /// Answer the pending choice (0-based).
@@ -543,5 +720,8 @@ mod tests {
         vm.set(6240, 4);
         let r = host.render(&vm, "`$(1,1)@❝No, $K85pork$K0, $C[60ff40]pitch no.$v(#6240+1)$C[]❞");
         assert_eq!(WebHost::speaker(&r), ("Tokido".into(), "❝No, pork, pitch no.5❞".into()));
+        let segs = host.render_rich(&vm, "a $K85pork$K0 b $C[60ff40]c$C[] d");
+        let flat: Vec<(&str, &str, bool)> = segs.iter().map(|g| (g.text.as_str(), g.color.as_str(), g.keyword)).collect();
+        assert_eq!(flat, vec![("a ", "", false), ("pork", "", true), (" b ", "", false), ("c", "60ff40", false), (" d", "", false)]);
     }
 }

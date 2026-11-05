@@ -73,6 +73,21 @@ x 336 and 944), `DRAW frames [rule]` crossfades to it, `WAIT` waits for it.
 `$C[rrggbb]...$C[]` colour; `$K85...$K0` glossary keyword; `$S024`, `$I{n}`,
 `$w`. Choice options are split by `$d`.
 
+## Saves
+
+`Vm::save`/`Vm::load` (luca-vm/src/save.rs): versioned binary, positions as
+(scene name, byte offset), variables sparse, about 1.5 KB. The player's save
+adds string-variable slots and the page's own state (frame on screen, music,
+the line being shown). Loading keeps the current persistent flags
+(`#12000`-`#12999`), which the page stores separately. A save taken at a line
+replays identically to continuing (`luca-web/examples/savecheck.rs`).
+
+Refrain unlocks on the title screen once `#12002` is set (end of Rin's route,
+SEEN2001). The title screen is SYSCG `TITLE01`.
+
+`DRAW`'s second argument (10002, 10041, 10042) is not an image id in any
+archive; its effect is unknown, drawn as a crossfade.
+
 ## Expressions
 
 C-like: `#N`, `#N[e]` (= variable N+e), integers, `|| && | & == != < <= > >=

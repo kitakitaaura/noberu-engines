@@ -9,6 +9,7 @@
 //! flag/jump simulator; the browser player is another host.
 
 pub mod expr;
+pub mod save;
 
 use expr::{index_var, Expr};
 use luca_script::{ArithOp, Kind, Script};
@@ -419,6 +420,37 @@ mod tests {
         assert_eq!(vm.get(20001), 7, "local restored after FARRETURN");
         assert_eq!(vm.get(2), 5, "globals written by the callee stay");
         assert_eq!(vm.get(1), 1);
+    }
+
+    #[test]
+    fn save_round_trip_inside_a_call() {
+        let mut call = vec![0, 0];
+        call.extend_from_slice(b"SUB\0");
+        call.extend_from_slice(&0u32.to_le_bytes());
+        let mut sel = Vec::new();
+        for x in [6001u16, 0, 0, 0] {
+            sel.extend_from_slice(&x.to_le_bytes());
+        }
+        for s in ["a$db", "A$dB"] {
+            for u in s.encode_utf16().chain([0]) {
+                sel.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        let g = game(vec![
+            ("MAIN", vec![equn(20001, 7), equn(5, 3), rec("FARCALL", &call), equn(1, 1), rec("END", &[])]),
+            ("SUB", vec![equn(20001, 99), rec("SELECT", &sel), equn(2, 5), rec("FARRETURN", &[])]),
+        ]);
+        let mut vm = Vm::new(0);
+        assert!(matches!(vm.run(&g, &mut Quiet, 100), Stop::Select { .. }));
+        let bytes = vm.save(&g);
+        let mut back = Vm::load(&g, &bytes).unwrap();
+        assert_eq!((back.scene, back.pc, back.pending_select), (vm.scene, vm.pc, vm.pending_select));
+        assert_eq!(back.vars, vm.vars);
+        assert_eq!(back.far.len(), 1);
+        back.choose(1);
+        assert_eq!(back.run(&g, &mut Quiet, 100), Stop::End);
+        assert_eq!((back.get(20001), back.get(5), back.get(2), back.get(1), back.get(6001)), (7, 3, 5, 1, 1));
+        assert!(Vm::load(&g, b"junk").is_err());
     }
 
     #[test]
