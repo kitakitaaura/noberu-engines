@@ -31,8 +31,8 @@ pub enum Target {
 
 #[derive(Debug, Clone)]
 pub enum Insn {
-    /// Visual/audio/system command with no effect on flow.
-    Nop,
+    /// Visual, audio or window command: handed to [`Host::show`].
+    Show,
     Message,
     Select { var: u16, options: usize },
     If { jump_if_true: bool, cond: Expr, to: usize },
@@ -167,15 +167,22 @@ fn compile_op(
                 *op.params.get(1).unwrap_or(&0),
             ])),
             n if ENGINE_OPS.contains(&n) => Insn::Engine,
-            _ => Insn::Nop,
+            _ => Insn::Show,
         },
     })
 }
 
 /// What the VM needs from whoever runs it.
 pub trait Host {
-    /// A line of text is shown (scene, instruction index).
-    fn message(&mut self, _scene: usize, _pc: usize) {}
+    /// A line of text (scene, instruction index). Return true to pause.
+    fn message(&mut self, _game: &Game, _vm: &Vm, _scene: usize, _pc: usize) -> bool {
+        false
+    }
+    /// Visual, audio or window command. Return true to pause (e.g. WAIT
+    /// until a transition ends).
+    fn show(&mut self, _game: &Game, _vm: &Vm, _scene: usize, _pc: usize) -> bool {
+        false
+    }
     fn trophy(&mut self, _id: u16) {}
     /// Engine-side command (minigame etc.). May change variables, and may move
     /// `vm.scene`/`vm.pc`, which the VM then continues from.
@@ -194,6 +201,8 @@ pub enum Stop {
     End,
     /// Step budget used up (likely a loop waiting on the engine).
     Limit,
+    /// The host asked to pause; `run` again to continue with the next command.
+    Pause,
 }
 
 #[derive(Clone)]
@@ -253,8 +262,18 @@ impl Vm {
             let insn = &code[self.pc];
             let mut next = self.pc + 1;
             match insn {
-                Insn::Nop => {}
-                Insn::Message => host.message(self.scene, self.pc),
+                Insn::Show => {
+                    if host.show(game, self, self.scene, self.pc) {
+                        self.pc = next;
+                        return Stop::Pause;
+                    }
+                }
+                Insn::Message => {
+                    if host.message(game, self, self.scene, self.pc) {
+                        self.pc = next;
+                        return Stop::Pause;
+                    }
+                }
                 Insn::Select { var, options } => {
                     self.pending_select = Some(*var);
                     return Stop::Select { var: *var, options: *options };

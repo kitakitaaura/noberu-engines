@@ -276,7 +276,7 @@ fn advance_one(game: &Game, mut vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Repo
             }
             out.push((pack(&vm, path, options), k))
         }
-        Stop::End | Stop::Limit => {
+        Stop::End | Stop::Limit | Stop::Pause => {
             if stop == Stop::End {
                 for v in PERSISTENT {
                     let x = vm.vars[v];

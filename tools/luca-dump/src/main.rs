@@ -81,9 +81,10 @@ fn list(path: &str) -> Res<()> {
     let mut out = std::io::stdout().lock();
     for e in pak.entries() {
         let head = pak.read(&Entry { length: e.length.min(4), ..e.clone() })?;
+        let u1 = e.unknown1.map(|u| u.iter().map(|b| format!("{b:02x}")).collect::<String>()).unwrap_or_default();
         writeln!(
             out,
-            "{:>6} #{:<6} {:<32} {:>10} @{:<11} {}",
+            "{:>6} #{:<6} {:<32} {:>10} @{:<11} {} {u1}",
             e.index,
             e.id,
             e.name.as_deref().unwrap_or("-"),
@@ -115,6 +116,12 @@ fn png_cmd(path: &str, key: &str, out: &str) -> Res<()> {
     let h = cz.header();
     to_png(cz.as_raw(), h.width() as u32, h.height() as u32, Path::new(out))?;
     println!("{:?} {}x{} depth {} -> {out}", h.version(), h.width(), h.height(), h.depth());
+    if let Some(x) = cz.extended_header() {
+        println!(
+            "  offset ({}, {}) crop {}x{} bounds {}x{} unknown {:?}x{:?}",
+            x.offset_x, x.offset_y, x.crop_width, x.crop_height, x.bounds_width, x.bounds_height, x.unknown_width, x.unknown_height
+        );
+    }
     Ok(())
 }
 

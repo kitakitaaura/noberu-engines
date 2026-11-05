@@ -11,6 +11,7 @@ luca-pak = { path = "../../crates/luca-pak" }
 luca-cz = { path = "../../crates/luca-cz" }
 luca-script = { path = "../../crates/luca-script" }
 luca-vm = { path = "../../crates/luca-vm" }
+luca-lbee = { path = "../../crates/luca-lbee" }
 png = "0.17"
 
 [lints]

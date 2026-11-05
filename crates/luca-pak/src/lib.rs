@@ -20,7 +20,7 @@ use std::io;
 use thiserror::Error;
 use vfs::RangeRead;
 
-const HEADER_LEN: usize = 9 * 4;
+pub const HEADER_LEN: usize = 9 * 4;
 /// Sanity limit on the index size we will read up front.
 const MAX_INDEX_BYTES: u32 = 64 << 20;
 const MAX_ENTRIES: u32 = 1_000_000;
@@ -80,6 +80,18 @@ pub struct Entry {
     pub unknown1: Option<[u8; 12]>,
 }
 
+/// A parsed index: everything except the entry data.
+pub struct Index {
+    pub header: Header,
+    pub subdirectory: Option<String>,
+    pub entries: Vec<Entry>,
+    /// Bytes between the entry table and the data. In Little Busters! EE's
+    /// CHARCG this is one u16 per entry: the base (body) image a face image
+    /// is drawn on, 0 for images that stand alone.
+    pub extra: Vec<u8>,
+    by_name: HashMap<String, usize>,
+}
+
 pub struct Pak<R: RangeRead> {
     src: R,
     pub header: Header,
@@ -122,12 +134,15 @@ impl Cursor<'_> {
     }
 }
 
-impl<R: RangeRead> Pak<R> {
-    /// Read the index. Entry data is not touched.
-    pub fn open(src: R) -> Result<Self, PakError> {
-        let mut head = [0u8; HEADER_LEN];
-        src.read_at(0, &mut head)?;
-        let mut c = Cursor { buf: &head, pos: 0 };
+impl Index {
+    /// Size of the index from the first 36 bytes of the archive: read that
+    /// many bytes from the start and pass them to [`Index::parse`].
+    pub fn index_len(head: &[u8]) -> Result<usize, PakError> {
+        Ok(Self::header(head)?.data_offset as usize)
+    }
+
+    fn header(head: &[u8]) -> Result<Header, PakError> {
+        let mut c = Cursor { buf: head, pos: 0 };
         let header = Header {
             data_offset: c.u32()?,
             entry_count: c.u32()?,
@@ -140,18 +155,23 @@ impl<R: RangeRead> Pak<R> {
         if header.entry_count > MAX_ENTRIES {
             return Err(PakError::Header(format!("{} entries", header.entry_count)));
         }
-        if header.data_offset as usize <= HEADER_LEN
-            || header.data_offset > MAX_INDEX_BYTES
-            || header.data_offset as u64 > src.len()
-        {
+        if header.data_offset as usize <= HEADER_LEN || header.data_offset > MAX_INDEX_BYTES {
             return Err(PakError::Header(format!("data_offset {}", header.data_offset)));
         }
         if header.block_size == 0 {
             return Err(PakError::Header("block_size 0".into()));
         }
+        Ok(header)
+    }
 
-        let index = src.read_vec(0, header.data_offset as usize)?;
-        let mut c = Cursor { buf: &index, pos: HEADER_LEN };
+    /// Parse the index (the archive's first `index_len` bytes) of an archive
+    /// `total` bytes long.
+    pub fn parse(index: &[u8], total: u64) -> Result<Self, PakError> {
+        let header = Self::header(index)?;
+        if header.data_offset as u64 > total || index.len() < header.data_offset as usize {
+            return Err(PakError::Header(format!("data_offset {}", header.data_offset)));
+        }
+        let mut c = Cursor { buf: index, pos: HEADER_LEN };
         for _ in 0..header.flags.extra_pre_count() {
             c.u32()?;
         }
@@ -176,7 +196,7 @@ impl<R: RangeRead> Pak<R> {
             None
         };
 
-        let total = src.len();
+        let extra = index[c.pos.min(header.data_offset as usize)..header.data_offset as usize].to_vec();
         let mut entries = Vec::with_capacity(n);
         let mut by_name = HashMap::with_capacity(if names.is_some() { n } else { 0 });
         for (i, &(block, length)) in table.iter().enumerate() {
@@ -197,7 +217,40 @@ impl<R: RangeRead> Pak<R> {
                 unknown1: unknown1.as_ref().map(|v| v[i]),
             });
         }
+        Ok(Self { header, subdirectory, entries, extra, by_name })
+    }
 
+    /// Per-entry u16 base ids from [`Index::extra`] (0 = none), when it is
+    /// long enough to hold one per entry.
+    pub fn base_ids(&self) -> Option<Vec<u16>> {
+        let n = self.entries.len();
+        (self.extra.len() >= 2 * n)
+            .then(|| (0..n).map(|i| u16::from_le_bytes([self.extra[2 * i], self.extra[2 * i + 1]])).collect())
+    }
+
+    /// Look up by name, case-insensitive (scripts and logs differ in case).
+    pub fn find(&self, name: &str) -> Option<&Entry> {
+        self.by_name.get(&name.to_ascii_uppercase()).map(|&i| &self.entries[i])
+    }
+
+    /// Look up by the numeric id scripts use.
+    pub fn by_id(&self, id: u32) -> Option<&Entry> {
+        let i = id.checked_sub(self.header.id_start)? as usize;
+        self.entries.get(i)
+    }
+}
+
+impl<R: RangeRead> Pak<R> {
+    /// Read the index. Entry data is not touched.
+    pub fn open(src: R) -> Result<Self, PakError> {
+        let mut head = [0u8; HEADER_LEN];
+        src.read_at(0, &mut head)?;
+        let len = Index::index_len(&head)?;
+        if len as u64 > src.len() {
+            return Err(PakError::Header(format!("data_offset {len}")));
+        }
+        let index = Index::parse(&src.read_vec(0, len)?, src.len())?;
+        let Index { header, subdirectory, entries, by_name, .. } = index;
         Ok(Self { src, header, subdirectory, entries, by_name })
     }
 
