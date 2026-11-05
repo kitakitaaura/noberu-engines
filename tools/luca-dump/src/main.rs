@@ -6,6 +6,14 @@
 //!   luca-dump png <file.PAK> <name|#id> <out.png>
 //!   luca-dump cz-census <file.PAK> [limit]  decode CZ entries, report failures
 //!   luca-dump cz-hash <file.PAK>            hash of every decoded CZ (golden checks)
+//!   luca-dump scripts <SCRIPT.PAK> <outdir> decompile every scene; check jump targets
+//!   luca-dump sim <SCRIPT.PAK> [runs] [seed]  random playouts from SEEN0513
+//!   luca-dump engine-vars <SCRIPT.PAK>      variables only the engine sets
+//!   luca-dump explore <SCRIPT.PAK> [cap] [seed] [#var=value,...]  breadth-first search over choices
+//!   luca-dump campaign <SCRIPT.PAK> [cap] [seed]  repeat the search, carrying persistent flags between rounds
+
+mod explore;
+mod sim;
 
 use luca_pak::{Entry, Pak};
 use std::io::Write;
@@ -160,6 +168,51 @@ fn cz_hash(path: &str) -> Res<()> {
     Ok(())
 }
 
+fn scripts(path: &str, outdir: &str) -> Res<()> {
+    let pak = open(path)?;
+    std::fs::create_dir_all(outdir)?;
+    let names: std::collections::HashSet<String> =
+        pak.entries().iter().filter_map(|e| e.name.clone()).map(|n| n.to_ascii_uppercase()).collect();
+    let (mut total, mut raw, mut bad_jumps, mut bad_files) = (0usize, 0usize, 0usize, 0usize);
+    let mut raw_by_name = std::collections::BTreeMap::<&str, usize>::new();
+    for e in pak.entries() {
+        let name = e.name.clone().unwrap_or_else(|| format!("#{}", e.id));
+        let s = match luca_script::Script::parse(&name, &pak.read(e)?) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("PARSE {err}");
+                continue;
+            }
+        };
+        let mut out = std::io::BufWriter::new(std::fs::File::create(Path::new(outdir).join(format!("{name}.txt")))?);
+        for op in &s.ops {
+            total += 1;
+            if op.kind == luca_script::Kind::Raw {
+                raw += 1;
+                *raw_by_name.entry(op.name()).or_default() += 1;
+            }
+            for t in op.local_targets() {
+                if s.index_of(t).is_none() {
+                    bad_jumps += 1;
+                    eprintln!("{name} @{}: {} -> @{t} is not a command start", op.pos, op.name());
+                }
+            }
+            if let luca_script::Kind::FarCall { file, .. } | luca_script::Kind::Jump { file, .. } = &op.kind {
+                if !names.contains(&file.to_ascii_uppercase()) {
+                    bad_files += 1;
+                    eprintln!("{name} @{}: {} -> missing scene {file:?}", op.pos, op.name());
+                }
+            }
+            writeln!(out, "{}: {op}", op.pos)?;
+        }
+    }
+    println!("{total} commands, {raw} without a decoded layout, {bad_jumps} bad local jumps, {bad_files} missing scenes");
+    for (n, c) in raw_by_name.iter().filter(|(_, c)| **c >= 50) {
+        println!("  raw {c:>7}  {n}");
+    }
+    Ok(())
+}
+
 fn main() -> Res<()> {
     let a: Vec<String> = std::env::args().collect();
     let arg = |i: usize| a.get(i).map(String::as_str).ok_or("missing argument");
@@ -174,6 +227,101 @@ fn main() -> Res<()> {
         }
         Some("png") => png_cmd(arg(2)?, arg(3)?, arg(4)?),
         Some("cz-hash") => cz_hash(arg(2)?),
+        Some("scripts") => scripts(arg(2)?, arg(3)?),
+        Some("sim") => {
+            let game = sim::load_game(arg(2)?)?;
+            let runs = a.get(3).map_or(Ok(100), |s| s.parse())?;
+            let seed = a.get(4).map_or(Ok(1), |s| s.parse())?;
+            sim::playouts(&game, "SEEN0513", runs, seed);
+            Ok(())
+        }
+        Some("explore") => {
+            let game = sim::load_game(arg(2)?)?;
+            let cap = a.get(3).map_or(Ok(20_000), |s| s.parse())?;
+            let seed = a.get(4).map_or(Ok(1), |s| s.parse())?;
+            let mut persist = Vec::new();
+            for kv in a.get(5).map(String::as_str).unwrap_or("").split(',').filter(|s| !s.is_empty()) {
+                let (k, v) = kv.trim_start_matches('#').split_once('=').ok_or("use #var=value")?;
+                persist.push((k.parse()?, v.parse()?));
+            }
+            let t = Instant::now();
+            let rep = explore::bfs(&game, "SEEN0513", &persist, cap, seed);
+            println!("levels (frontier per choice depth): {:?}", rep.levels);
+            println!("time {:?}", t.elapsed());
+            println!("trophies:");
+            for (t, f) in &rep.trophies {
+                let p: String = f.path.iter().map(|c| char::from(b'0' + c)).collect();
+                println!("  {t:>3}  after {:>3} choices  {p}", f.depth);
+            }
+            println!("endings:");
+            for (e, f) in &rep.endings {
+                println!("  {e}  (after {} choices)", f.depth);
+            }
+            let missing: Vec<_> = game
+                .scenes
+                .iter()
+                .map(|s| s.script.name.clone())
+                .filter(|n| !rep.scenes.contains_key(n))
+                .collect();
+            println!("scenes with text never shown: {} {:?}", missing.len(), missing);
+            Ok(())
+        }
+        Some("campaign") => {
+            let game = sim::load_game(arg(2)?)?;
+            let cap = a.get(3).map_or(Ok(20_000), |s| s.parse())?;
+            let seed = a.get(4).map_or(Ok(1), |s| s.parse())?;
+            let mut persist: std::collections::BTreeMap<u16, i32> = Default::default();
+            let mut trophies: std::collections::BTreeMap<u16, (usize, String)> = Default::default();
+            let mut endings: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut scenes: std::collections::BTreeSet<String> = Default::default();
+            for round in 1..=8 {
+                let t = Instant::now();
+                let flags: Vec<(u16, i32)> = persist.iter().map(|(k, v)| (*k, *v)).collect();
+                let rep = explore::bfs(&game, "SEEN0513", &flags, cap, seed + round as u64);
+                let before = (trophies.len(), endings.len(), persist.len());
+                for (t, f) in &rep.trophies {
+                    let p: String = f.path.iter().map(|c| char::from(b'0' + c)).collect();
+                    trophies.entry(*t).or_insert((round, p));
+                }
+                for e in rep.endings.keys() {
+                    endings.entry(e.clone()).or_insert(round);
+                }
+                scenes.extend(rep.scenes.keys().cloned());
+                for (k, v) in rep.persist {
+                    let e = persist.entry(k).or_insert(v);
+                    *e = (*e).max(v);
+                }
+                println!(
+                    "round {round}: {} trophies, {} endings, {} persistent flags set, {:?}",
+                    trophies.len(),
+                    endings.len(),
+                    persist.len(),
+                    t.elapsed()
+                );
+                if (trophies.len(), endings.len(), persist.len()) == before {
+                    break;
+                }
+            }
+            println!("trophies (first round reached, choice path):");
+            for (t, (r, p)) in &trophies {
+                println!("  {t:>3}  round {r}  {} choices  {p}", p.len());
+            }
+            println!("endings (first round reached):");
+            for (e, r) in &endings {
+                println!("  {e}  round {r}");
+            }
+            let missing: Vec<_> =
+                game.scenes.iter().map(|s| s.script.name.clone()).filter(|n| !scenes.contains(n)).collect();
+            println!("scenes with text never shown: {} {:?}", missing.len(), missing);
+            Ok(())
+        }
+        Some("engine-vars") => {
+            let game = sim::load_game(arg(2)?)?;
+            for (v, n) in sim::engine_vars(&game) {
+                println!("#{v}\tread {n}x");
+            }
+            Ok(())
+        }
         Some("cz-census") => cz_census(arg(2)?, a.get(3).map_or(Ok(usize::MAX), |s| s.parse())?),
         _ => {
             eprintln!("usage: luca-dump summary|list|cat|png|cz-census ...");

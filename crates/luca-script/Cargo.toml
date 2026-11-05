@@ -1,0 +1,13 @@
+[package]
+name = "luca-script"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "LUCA System script reader. Layouts from LuckSystem (wetor, MIT) and lbee-utils (G2, GPLv3)."
+
+[dependencies]
+encoding_rs = "0.8"
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

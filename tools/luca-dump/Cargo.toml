@@ -9,6 +9,8 @@ description = "Dev tool: list PAK archives, extract entries, decode CZ images to
 vfs = { path = "../../crates/vfs" }
 luca-pak = { path = "../../crates/luca-pak" }
 luca-cz = { path = "../../crates/luca-cz" }
+luca-script = { path = "../../crates/luca-script" }
+luca-vm = { path = "../../crates/luca-vm" }
 png = "0.17"
 
 [lints]
