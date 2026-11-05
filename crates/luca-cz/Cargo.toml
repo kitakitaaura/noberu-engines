@@ -1,0 +1,21 @@
+[package]
+name = "luca-cz"
+version = "0.1.0"
+edition = "2024"
+description = "CZ0-CZ4 image decoder for the LUCA System engine. Vendored from lbee-utils' cz crate (G2, GPLv3)."
+license = "GPL-3.0-or-later"
+authors = ["G2", "noberu"]
+
+[features]
+default = []
+# Palette generation for writing 8-bit CZ files (pulls in imagequant; not needed to play)
+encode = ["dep:imagequant"]
+
+[dependencies]
+byteorder = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+imagequant = { version = "4.4", optional = true }
+
+[lints]
+workspace = true

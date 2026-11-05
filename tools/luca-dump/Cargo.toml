@@ -1,0 +1,15 @@
+[package]
+name = "luca-dump"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Dev tool: list PAK archives, extract entries, decode CZ images to PNG."
+
+[dependencies]
+vfs = { path = "../../crates/vfs" }
+luca-pak = { path = "../../crates/luca-pak" }
+luca-cz = { path = "../../crates/luca-cz" }
+png = "0.17"
+
+[lints]
+workspace = true
