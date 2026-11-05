@@ -125,6 +125,30 @@ alone loses Rin's). Minigame segments are run with 4 dice (path letters
 no script jumps to: the executable starts it), carrying the persistent
 flags left at all endings found so far.
 
+## Results (2026-11-05, campaign cap 5000, ~80 s)
+
+15 of 27 trophies reached, every path replayed from scratch:
+
+| Trophy | Route |
+|---|---|
+| 1 | first day |
+| 2, 3, 4, 6, 8, 9 | Komari, Haruka, Kurugaya, Kud, Mio, Rin (first playthrough) |
+| 5, 7 | Kurugaya's and Kud's other endings |
+| 10 | Rin (second, `SEEN2001`) |
+| 11 | Sasami |
+| 12 | Kanata |
+| 14, 15 | Refrain |
+| 27 | side event, 5/27 |
+
+Missing: Saya (13, 18, 25: labyrinth days 3-5 and the final arc's
+labyrinth are unsolved), 16 (needs Sasami + Saya + Kanata), 17 and the side
+trophies 19-24, 26 (minigame results: batting practice level `#6005`,
+baseball `#6007`, battle rank `#14002`; dice may not hit them).
+
+Saya's game over is an engine dialog (`TASK 54`, "REPLAY / GAME END",
+result in `#6005`); replay continues through `RETURN` with no GOSUB frame
+into `JUMP seen2810`, so the VM treats an empty-stack RETURN as a no-op.
+
 ## Tools
 
 ```

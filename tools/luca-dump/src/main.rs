@@ -9,7 +9,7 @@
 //!   luca-dump scripts <SCRIPT.PAK> <outdir> decompile every scene; check jump targets
 //!   luca-dump sim <SCRIPT.PAK> [runs] [seed]  random playouts from SEEN0513
 //!   luca-dump engine-vars <SCRIPT.PAK>      variables only the engine sets
-//!   luca-dump explore <SCRIPT.PAK> [cap] [seed] [#var=value,...]  breadth-first search over choices
+//!   luca-dump explore <SCRIPT.PAK> [cap] [seed] [#var=value,...] [start]  breadth-first search over choices
 //!   luca-dump campaign <SCRIPT.PAK> [cap] [seed]  repeat the search, carrying persistent flags between rounds
 //!   luca-dump probe <SCRIPT.PAK> <scene> [#var=value,...]  run one scene with stubs, show where it sticks
 //!   luca-dump replay <SCRIPT.PAK> <start> <seed> <choices> [#var=value,...]  play one path, show what it reached
@@ -263,7 +263,8 @@ fn main() -> Res<()> {
                 persist.push((k.parse()?, v.parse()?));
             }
             let t = Instant::now();
-            let rep = explore::bfs(&game, "SEEN0513", &persist, cap, seed);
+            let start = a.get(6).map_or("SEEN0513", String::as_str);
+            let rep = explore::bfs(&game, start, &persist, cap, seed);
             println!("levels (frontier per choice depth): {:?}", rep.levels);
             println!("time {:?}", t.elapsed());
             println!("trophies:");

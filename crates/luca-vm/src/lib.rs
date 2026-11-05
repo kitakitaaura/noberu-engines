@@ -177,7 +177,8 @@ pub trait Host {
     /// A line of text is shown (scene, instruction index).
     fn message(&mut self, _scene: usize, _pc: usize) {}
     fn trophy(&mut self, _id: u16) {}
-    /// Engine-side command (minigame etc.). May change variables.
+    /// Engine-side command (minigame etc.). May change variables, and may move
+    /// `vm.scene`/`vm.pc`, which the VM then continues from.
     fn engine(&mut self, _game: &Game, _vm: &mut Vm, _scene: usize, _pc: usize) {}
     /// Random integer in lo..=hi.
     fn random(&mut self, lo: i32, _hi: i32) -> i32 {
@@ -268,13 +269,14 @@ impl Vm {
                     self.gosub.push((self.scene, self.pc + 1));
                     next = *to;
                 }
-                Insn::Return => match self.gosub.pop() {
-                    Some((s, pc)) => {
+                Insn::Return => {
+                    // With no GOSUB to return to, execution continues: Saya's
+                    // game-over block ends `RETURN; JUMP seen2810` (replay).
+                    if let Some((s, pc)) = self.gosub.pop() {
                         self.scene = s;
                         next = pc;
                     }
-                    None => return Stop::End,
-                },
+                }
                 Insn::FarCall { scene, to } => {
                     let locals = self.vars[LOCAL_VARS].into();
                     self.far.push(Frame { scene: self.scene, pc: self.pc + 1, locals });
@@ -339,6 +341,10 @@ impl Vm {
                 Insn::Engine => {
                     let (s, pc) = (self.scene, self.pc);
                     host.engine(game, self, s, pc);
+                    if (self.scene, self.pc) != (s, pc) {
+                        // the host moved control (e.g. a minigame jumping out)
+                        continue;
+                    }
                 }
             }
             self.pc = next;

@@ -256,7 +256,10 @@ fn advance(game: &Game, vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Report, out:
 /// Returns whether a minigame stub ran.
 fn advance_one(game: &Game, mut vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Report, out: &mut Vec<(Node, u64)>) -> bool {
     let mut host = Recorder { rng: Some(Rng(segment_seed(seed, &path))), ..Default::default() };
-    let stop = vm.run(game, &mut host, SEGMENT_BUDGET);
+    let mut stop = vm.run(game, &mut host, SEGMENT_BUDGET);
+    if vm.get(crate::sim::MAZE_STEP) == crate::sim::MAZE_STUCK {
+        stop = Stop::Limit;
+    }
     let depth = path.iter().filter(|&&c| c < DICE).count();
     for t in host.trophies.drain(..) {
         keep(&mut rep.trophies, t, Found { path: path.clone(), depth });

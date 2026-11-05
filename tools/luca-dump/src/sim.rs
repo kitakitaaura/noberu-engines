@@ -80,10 +80,10 @@ impl Host for Recorder {
             }
             // Saya's labyrinth (SEEN2804-2808): TASK 45 is one move; the
             // engine reports the tile in #10003/#10004.
-            "TASK" if arg == 45 => {
-                *minigame = true;
-                maze_step(game, vm, s, pc)
-            }
+            // (deterministic: no dice needed)
+            "TASK" if arg == 45 => maze_step(game, vm, s, pc),
+            // Saya's game-over dialog "REPLAY / GAME END": always replay.
+            "TASK" if arg == 54 => vm.set(6005, 0),
             _ => {}
         }
     }
@@ -96,7 +96,13 @@ impl Host for Recorder {
 }
 
 /// Spare variable (never used by the game) holding the labyrinth walk position.
-const MAZE_STEP: u16 = 65535;
+pub const MAZE_STEP: u16 = 65535;
+/// Spare variable counting all labyrinth moves this run (never reset).
+const MAZE_MOVES: u16 = 65534;
+/// Moves before the labyrinth stub gives up.
+const MAZE_GIVE_UP: usize = 300;
+/// MAZE_STEP value after giving up: the run's End is not a real ending.
+pub const MAZE_STUCK: i32 = -1;
 
 /// Tiles the labyrinth loop after `pc` tests, as (x, y, is_exit). A tile is
 /// the exit when its block never jumps back to the move.
@@ -145,6 +151,14 @@ fn maze_step(game: &Game, vm: &mut Vm, s: usize, pc: usize) {
     let events: Vec<_> = tiles.iter().filter(|t| !t.2).collect();
     let exit = tiles.iter().find(|t| t.2);
     let step = vm.get(MAZE_STEP) as usize;
+    let moves = vm.get(MAZE_MOVES) as usize + 1;
+    vm.set(MAZE_MOVES, moves as i32);
+    if moves > MAZE_GIVE_UP {
+        // Unsolved puzzle: jump to the End appended after the scene and mark it.
+        vm.pc = game.scenes[s].code.len() - 1;
+        vm.set(MAZE_STEP, MAZE_STUCK);
+        return;
+    }
     // Every event tile three times (some unlock others), then the exit.
     // Days 3-5 (SEEN2806-2808) have puzzles this does not solve yet.
     let tile = if step < events.len() * 3 { Some(events[step % events.len()]) } else { exit };
