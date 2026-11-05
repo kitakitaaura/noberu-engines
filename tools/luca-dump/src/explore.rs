@@ -5,13 +5,20 @@
 //! stacks and the same story flags (#0-#1999, persistent #12000-#12999).
 //! Minigame and system variables are left out of the key, so a merge can in
 //! principle hide a path; every path reported is still a real sequence of
-//! choices that reaches its goal when replayed.
+//! choices, and [`replay`] checks it.
+//!
+//! Minigame stubs draw random numbers from a generator seeded by the search
+//! seed and the choice path, so a path replays the same way every time.
+//! Each depth runs on all CPU cores.
 
 use crate::sim::{Recorder, Rng, PERSISTENT};
 use luca_vm::{Game, Stop, Vm};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
+
+/// Instructions one segment (choice to choice) may run before we call it stuck.
+const SEGMENT_BUDGET: usize = 2_000_000;
 
 /// Paused VM stored compactly: nonzero variables only.
 struct Node {
@@ -22,9 +29,10 @@ struct Node {
     far: Vec<luca_vm::Frame>,
     pending: Option<u16>,
     path: Vec<u8>,
+    options: usize,
 }
 
-fn pack(vm: &Vm, path: Vec<u8>) -> Node {
+fn pack(vm: &Vm, path: Vec<u8>, options: usize) -> Node {
     let vars = vm.vars.iter().enumerate().filter(|(_, v)| **v != 0).map(|(i, v)| (i as u16, *v)).collect();
     Node {
         scene: vm.scene,
@@ -34,6 +42,7 @@ fn pack(vm: &Vm, path: Vec<u8>) -> Node {
         far: vm.far.clone(),
         pending: vm.pending_select,
         path,
+        options,
     }
 }
 
@@ -61,11 +70,30 @@ fn key(vm: &Vm) -> u64 {
     h.finish()
 }
 
+/// Seed for the segment that follows `path` (FNV-1a over the path).
+fn segment_seed(seed: u64, path: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+    for &b in path {
+        h = (h ^ (b as u64 + 1)).wrapping_mul(0x100_0000_01b3);
+    }
+    h | 1
+}
+
+#[derive(Clone)]
 pub struct Found {
     pub path: Vec<u8>,
     pub depth: usize,
 }
 
+impl Found {
+    /// Keep the shortest path, ties broken by the path itself, so results
+    /// don't depend on thread timing.
+    fn better(&self, other: &Found) -> bool {
+        (self.depth, &self.path) < (other.depth, &other.path)
+    }
+}
+
+#[derive(Default)]
 pub struct Report {
     pub trophies: BTreeMap<u16, Found>,
     pub endings: BTreeMap<String, Found>,
@@ -76,27 +104,56 @@ pub struct Report {
     pub persist: BTreeMap<u16, i32>,
 }
 
-/// Explore from `start` with persistent flags `persist` (index from #12000).
-/// `cap` bounds the frontier per level (sampled down when exceeded).
-pub fn bfs(game: &Game, start: &str, persist: &[(u16, i32)], cap: usize, seed: u64) -> Report {
+fn keep<K: Ord>(map: &mut BTreeMap<K, Found>, k: K, f: Found) {
+    match map.entry(k) {
+        std::collections::btree_map::Entry::Vacant(e) => {
+            e.insert(f);
+        }
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            if f.better(e.get()) {
+                e.insert(f);
+            }
+        }
+    }
+}
+
+impl Report {
+    fn merge(&mut self, o: Report) {
+        for (k, f) in o.trophies {
+            keep(&mut self.trophies, k, f);
+        }
+        for (k, f) in o.endings {
+            keep(&mut self.endings, k, f);
+        }
+        for (k, n) in o.scenes {
+            *self.scenes.entry(k).or_default() += n;
+        }
+        for (k, v) in o.persist {
+            let e = self.persist.entry(k).or_insert(v);
+            *e = (*e).max(v);
+        }
+    }
+}
+
+fn start_vm(game: &Game, start: &str, persist: &[(u16, i32)]) -> Vm {
     let mut vm = Vm::new(game.scene(start).expect("start scene"));
     for &(v, x) in persist {
         vm.set(v, x);
     }
-    let mut rep = Report {
-        trophies: BTreeMap::new(),
-        endings: BTreeMap::new(),
-        scenes: BTreeMap::new(),
-        levels: Vec::new(),
-        persist: BTreeMap::new(),
-    };
+    vm
+}
+
+/// Explore from `start` with persistent flags `persist`.
+/// `cap` bounds the frontier per level (sampled down when exceeded).
+pub fn bfs(game: &Game, start: &str, persist: &[(u16, i32)], cap: usize, seed: u64) -> Report {
+    let mut rep = Report::default();
     let mut rng = Rng(seed | 1);
-    // Run the start up to the first choice.
     let mut frontier = Vec::new();
-    advance(game, vm, Vec::new(), &mut rep, &mut frontier, &mut rng);
+    advance(game, start_vm(game, start, persist), Vec::new(), seed, &mut rep, &mut frontier);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let t0 = std::time::Instant::now();
     // Visited across all depths: some menus loop back to themselves.
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<u64> = frontier.iter().map(|(_, k)| *k).collect();
     while !frontier.is_empty() {
         if frontier.len() > cap {
             // keep a random sample (Fisher-Yates prefix)
@@ -116,20 +173,36 @@ pub fn bfs(game: &Game, start: &str, persist: &[(u16, i32)], cap: usize, seed: u
                 t0.elapsed()
             );
         }
+        let chunk = frontier.len().div_ceil(threads);
+        let results: Vec<(Report, Vec<(Node, u64)>)> = std::thread::scope(|sc| {
+            let handles: Vec<_> = frontier
+                .chunks(chunk)
+                .map(|part| {
+                    sc.spawn(move || {
+                        let mut local = Report::default();
+                        let mut out = Vec::new();
+                        for (node, _) in part {
+                            let base = unpack(node);
+                            for i in 0..node.options {
+                                let mut vm = base.clone();
+                                vm.choose(i);
+                                let mut path = node.path.clone();
+                                path.push(i as u8);
+                                advance(game, vm, path, seed, &mut local, &mut out);
+                            }
+                        }
+                        (local, out)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("search thread")).collect()
+        });
         let mut next = Vec::new();
-        for (node, options, _) in frontier {
-            let base = unpack(&node);
-            for i in 0..options {
-                let mut vm = base.clone();
-                vm.choose(i);
-                let mut path = node.path.clone();
-                path.push(i as u8);
-                let mut out = Vec::new();
-                advance(game, vm, path, &mut rep, &mut out, &mut rng);
-                for (n, opts, k) in out {
-                    if seen.insert(k) {
-                        next.push((n, opts, k));
-                    }
+        for (local, out) in results {
+            rep.merge(local);
+            for (n, k) in out {
+                if seen.insert(k) {
+                    next.push((n, k));
                 }
             }
         }
@@ -139,19 +212,12 @@ pub fn bfs(game: &Game, start: &str, persist: &[(u16, i32)], cap: usize, seed: u
 }
 
 /// Run until the next choice or the end; record what happened.
-fn advance(
-    game: &Game,
-    mut vm: Vm,
-    path: Vec<u8>,
-    rep: &mut Report,
-    out: &mut Vec<(Node, usize, u64)>,
-    rng: &mut Rng,
-) {
-    let mut host = Recorder { rng: Some(Rng(rng.next() | 1)), ..Default::default() };
-    let stop = vm.run(game, &mut host, 50_000_000);
+fn advance(game: &Game, mut vm: Vm, path: Vec<u8>, seed: u64, rep: &mut Report, out: &mut Vec<(Node, u64)>) {
+    let mut host = Recorder { rng: Some(Rng(segment_seed(seed, &path))), ..Default::default() };
+    let stop = vm.run(game, &mut host, SEGMENT_BUDGET);
     let depth = path.len();
     for t in host.trophies.drain(..) {
-        rep.trophies.entry(t).or_insert_with(|| Found { path: path.clone(), depth });
+        keep(&mut rep.trophies, t, Found { path: path.clone(), depth });
     }
     for s in std::mem::take(&mut host.scenes) {
         *rep.scenes.entry(game.name(s).to_string()).or_default() += 1;
@@ -163,7 +229,7 @@ fn advance(
                 let op = &game.scenes[vm.scene].script.ops[vm.pc];
                 eprintln!("select after {:?} at {} @{}: {} key {k:x}", path, game.name(vm.scene), op.pos, op);
             }
-            out.push((pack(&vm, path), options, k))
+            out.push((pack(&vm, path, options), k))
         }
         Stop::End | Stop::Limit => {
             if stop == Stop::End {
@@ -176,7 +242,42 @@ fn advance(
                 }
             }
             let at = format!("{:?} {} @{}", stop, game.name(vm.scene), vm.pc);
-            rep.endings.entry(at).or_insert(Found { path, depth });
+            keep(&mut rep.endings, at, Found { path, depth });
+        }
+    }
+}
+
+/// What a replayed path did.
+pub struct Replay {
+    pub trophies: Vec<u16>,
+    pub stop: Stop,
+    pub at: String,
+    pub scenes: BTreeSet<String>,
+    /// Choices left unused when the run ended early (path doesn't fit).
+    pub unused: usize,
+}
+
+/// Play one path from a fresh start with the same per-segment random
+/// numbers the search used.
+pub fn replay(game: &Game, start: &str, persist: &[(u16, i32)], seed: u64, path: &[u8]) -> Replay {
+    let mut vm = start_vm(game, start, persist);
+    let mut trophies = Vec::new();
+    let mut scenes = BTreeSet::new();
+    let mut i = 0;
+    loop {
+        let mut host = Recorder { rng: Some(Rng(segment_seed(seed, &path[..i]))), ..Default::default() };
+        let stop = vm.run(game, &mut host, SEGMENT_BUDGET);
+        trophies.extend(host.trophies);
+        scenes.extend(host.scenes.iter().map(|s| game.name(*s).to_string()));
+        match stop {
+            Stop::Select { options, .. } if i < path.len() && (path[i] as usize) < options => {
+                vm.choose(path[i] as usize);
+                i += 1;
+            }
+            stop => {
+                let at = format!("{} @{}", game.name(vm.scene), game.scenes[vm.scene].script.ops.get(vm.pc).map_or(0, |o| o.pos));
+                return Replay { trophies, stop, at, scenes, unused: path.len() - i };
+            }
         }
     }
 }

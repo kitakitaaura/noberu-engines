@@ -71,6 +71,9 @@ impl Host for Recorder {
                 4 => vm.set(6215, pick(4)),
                 _ => {}
             },
+            // Saya's labyrinth (SEEN2804-2808): TASK 45 is one move; the
+            // engine reports the tile in #10003/#10004.
+            "TASK" if arg == 45 => maze_step(game, vm, s, pc),
             _ => {}
         }
     }
@@ -79,6 +82,50 @@ impl Host for Recorder {
             Some(r) => lo + r.below((hi - lo + 1) as usize) as i32,
             None => lo,
         }
+    }
+}
+
+/// Spare variable (never used by the game) holding the labyrinth walk position.
+const MAZE_STEP: u16 = 65535;
+
+/// Tiles the labyrinth loop after `pc` tests, as (x, y, is_exit). A tile is
+/// the exit when its block never jumps back to the move.
+fn maze_tiles(game: &Game, s: usize, pc: usize) -> Vec<(i32, i32, bool)> {
+    let script = &game.scenes[s].script;
+    let code = &game.scenes[s].code;
+    let mut tiles = Vec::new();
+    for i in pc + 1..script.ops.len() {
+        let op = &script.ops[i];
+        if op.name() == "TASK" && op.params.starts_with(&[45, 0]) {
+            break;
+        }
+        let luca_script::Kind::If { expr, .. } = &op.kind else { continue };
+        let Insn::If { to, .. } = &code[i] else { continue };
+        let loops_back = (i..*to).any(|j| matches!(code[j], Insn::Goto(t) if t <= pc));
+        // Every "#10003==X)&&(#10004==Y" pair in the condition (some test several tiles).
+        for part in expr.split("#10003==").skip(1) {
+            let Some((x, rest)) = part.split_once(")&&(#10004==") else { continue };
+            let y: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) else { continue };
+            if !tiles.iter().any(|t: &(i32, i32, bool)| t.0 == x && t.1 == y) {
+                tiles.push((x, y, !loops_back));
+            }
+        }
+    }
+    tiles
+}
+
+fn maze_step(game: &Game, vm: &mut Vm, s: usize, pc: usize) {
+    let tiles = maze_tiles(game, s, pc);
+    let events: Vec<_> = tiles.iter().filter(|t| !t.2).collect();
+    let exit = tiles.iter().find(|t| t.2);
+    let step = vm.get(MAZE_STEP) as usize;
+    // Every event tile three times (some unlock others), then the exit.
+    let tile = if step < events.len() * 3 { Some(events[step % events.len()]) } else { exit };
+    if let Some(&(x, y, is_exit)) = tile {
+        vm.set(10003, x);
+        vm.set(10004, y);
+        vm.set(MAZE_STEP, if is_exit { 0 } else { step as i32 + 1 });
     }
 }
 

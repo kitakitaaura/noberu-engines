@@ -11,6 +11,7 @@
 //!   luca-dump engine-vars <SCRIPT.PAK>      variables only the engine sets
 //!   luca-dump explore <SCRIPT.PAK> [cap] [seed] [#var=value,...]  breadth-first search over choices
 //!   luca-dump campaign <SCRIPT.PAK> [cap] [seed]  repeat the search, carrying persistent flags between rounds
+//!   luca-dump replay <SCRIPT.PAK> <start> <seed> <choices> [#var=value,...]  play one path, show what it reached
 
 mod explore;
 mod sim;
@@ -267,29 +268,42 @@ fn main() -> Res<()> {
             Ok(())
         }
         Some("campaign") => {
+            use std::collections::{BTreeMap, BTreeSet};
             let game = sim::load_game(arg(2)?)?;
             let cap = a.get(3).map_or(Ok(20_000), |s| s.parse())?;
-            let seed = a.get(4).map_or(Ok(1), |s| s.parse())?;
-            let mut persist: std::collections::BTreeMap<u16, i32> = Default::default();
-            let mut trophies: std::collections::BTreeMap<u16, (usize, String)> = Default::default();
-            let mut endings: std::collections::BTreeMap<String, usize> = Default::default();
-            let mut scenes: std::collections::BTreeSet<String> = Default::default();
+            let seed: u64 = a.get(4).map_or(Ok(1), |s| s.parse())?;
+            // How a trophy was first reached: enough to replay it.
+            struct Hit {
+                round: usize,
+                start: &'static str,
+                seed: u64,
+                flags: Vec<(u16, i32)>,
+                path: Vec<u8>,
+            }
+            let mut persist: BTreeMap<u16, i32> = Default::default();
+            let mut trophies: BTreeMap<u16, Hit> = Default::default();
+            let mut endings: BTreeMap<String, usize> = Default::default();
+            let mut scenes: BTreeSet<String> = Default::default();
             for round in 1..=8 {
                 let t = Instant::now();
                 let flags: Vec<(u16, i32)> = persist.iter().map(|(k, v)| (*k, *v)).collect();
-                let rep = explore::bfs(&game, "SEEN0513", &flags, cap, seed + round as u64);
                 let before = (trophies.len(), endings.len(), persist.len());
-                for (t, f) in &rep.trophies {
-                    let p: String = f.path.iter().map(|c| char::from(b'0' + c)).collect();
-                    trophies.entry(*t).or_insert((round, p));
-                }
-                for e in rep.endings.keys() {
-                    endings.entry(e.clone()).or_insert(round);
-                }
-                scenes.extend(rep.scenes.keys().cloned());
-                for (k, v) in rep.persist {
-                    let e = persist.entry(k).or_insert(v);
-                    *e = (*e).max(v);
+                // New game, and Refrain (SEEN2513: no script jumps there; the
+                // executable starts it once the routes are cleared).
+                for start in ["SEEN0513", "SEEN2513"] {
+                    let rseed = seed + round as u64;
+                    let rep = explore::bfs(&game, start, &flags, cap, rseed);
+                    for (t, f) in rep.trophies {
+                        trophies.entry(t).or_insert(Hit { round, start, seed: rseed, flags: flags.clone(), path: f.path });
+                    }
+                    for e in rep.endings.keys() {
+                        endings.entry(e.clone()).or_insert(round);
+                    }
+                    scenes.extend(rep.scenes.keys().cloned());
+                    for (k, v) in rep.persist {
+                        let e = persist.entry(k).or_insert(v);
+                        *e = (*e).max(v);
+                    }
                 }
                 println!(
                     "round {round}: {} trophies, {} endings, {} persistent flags set, {:?}",
@@ -302,9 +316,12 @@ fn main() -> Res<()> {
                     break;
                 }
             }
-            println!("trophies (first round reached, choice path):");
-            for (t, (r, p)) in &trophies {
-                println!("  {t:>3}  round {r}  {} choices  {p}", p.len());
+            println!("trophies (round, start, choices; replayed from scratch to check):");
+            for (t, h) in &trophies {
+                let r = explore::replay(&game, h.start, &h.flags, h.seed, &h.path);
+                let ok = if r.trophies.contains(t) { "ok" } else { "REPLAY FAILED" };
+                let p: String = h.path.iter().map(|c| char::from(b'0' + c)).collect();
+                println!("  {t:>3}  round {}  {}  {:>3} choices  {ok}  {p}", h.round, h.start, h.path.len());
             }
             println!("endings (first round reached):");
             for (e, r) in &endings {
@@ -313,6 +330,23 @@ fn main() -> Res<()> {
             let missing: Vec<_> =
                 game.scenes.iter().map(|s| s.script.name.clone()).filter(|n| !scenes.contains(n)).collect();
             println!("scenes with text never shown: {} {:?}", missing.len(), missing);
+            Ok(())
+        }
+        Some("replay") => {
+            let game = sim::load_game(arg(2)?)?;
+            let start = arg(3)?;
+            let seed: u64 = arg(4)?.parse()?;
+            let path: Vec<u8> = arg(5)?.bytes().map(|c| c - b'0').collect();
+            let mut flags = Vec::new();
+            for kv in a.get(6).map(String::as_str).unwrap_or("").split(',').filter(|s| !s.is_empty()) {
+                let (k, v) = kv.trim_start_matches('#').split_once('=').ok_or("use #var=value")?;
+                flags.push((k.parse()?, v.parse()?));
+            }
+            let r = explore::replay(&game, start, &flags, seed, &path);
+            println!("stopped: {:?} at {}", r.stop, r.at);
+            println!("trophies: {:?}", r.trophies);
+            println!("choices unused: {}", r.unused);
+            println!("scenes with text: {:?}", r.scenes);
             Ok(())
         }
         Some("engine-vars") => {
