@@ -52,6 +52,27 @@ first u16 of MESSAGE.
 
 `EQUN (8001, id)` after a background load records the current background.
 
+## Sprites (CHARCG)
+
+Most sprite ids the scripts load (22,422 of 29,055) are faces: small images
+of eyes and mouth. The body comes from CHARCG's index: the bytes after the
+entry table (before the data) are one u16 per entry, the base image a face
+is drawn on (0 = the image stands alone). E.g. face 10883 -> body 10869.
+Both are placed the same way: the script's (x, y), usually (640, 720), is
+where the image box's anchor (640, 770 in a 1280x820 box) goes; pixels sit
+at the CZ header's offset inside the box.
+
+Frames: `HAIKEI_SET` starts a frame with no sprites, `IMAGELOAD` mode 0 sets
+the background, mode 1 adds or replaces a sprite at its x (at most two:
+x 336 and 944), `DRAW frames [rule]` crossfades to it, `WAIT` waits for it.
+
+## Text codes
+
+`` `Name@`` speaker prefix; `$(slot,lang)` string variable (VARSTR copies
+`_VARSTR` entries jp/en into a slot; lang 1 = English); `$v(expr)` a value;
+`$C[rrggbb]...$C[]` colour; `$K85...$K0` glossary keyword; `$S024`, `$I{n}`,
+`$w`. Choice options are split by `$d`.
+
 ## Expressions
 
 C-like: `#N`, `#N[e]` (= variable N+e), integers, `|| && | & == != < <= > >=
